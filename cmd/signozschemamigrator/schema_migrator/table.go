@@ -209,3 +209,13 @@ func (d Distributed) EngineParams() string {
 func (d Distributed) ToSQL() string {
 	return fmt.Sprintf("Distributed('%s', %s, %s, %s)", d.Cluster, d.Database, d.Table, d.ShardingKey)
 }
+
+// BaseTableName returns the base table that this distributed table points to
+func (d Distributed) BaseTableName() string {
+	return d.Table
+}
+
+// BaseTableDatabase returns the database of the base table
+func (d Distributed) BaseTableDatabase() string {
+	return d.Database
+}

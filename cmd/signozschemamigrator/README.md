@@ -2,6 +2,39 @@
 
 This is a tool to manage the ClickHouse schema migrations.
 
+---
+
+## ObsessionDB / ClickHouse Cloud Fork
+
+This fork adds **standalone mode** for SharedMergeTree environments of [ObsessionDB](https://obsessiondb.com) and ClickHouse Cloud
+
+### Why Fork?
+
+The official schema-migrator creates:
+- `ReplicatedMergeTree` tables with `ON CLUSTER` (requires ZooKeeper)
+- Separate local + distributed table pairs (not needed with SharedMergeTree)
+
+### What We Changed
+
+**Standalone mode**:
+
+1. Creates `SharedMergeTree` tables instead of `ReplicatedMergeTree`
+2. Creates base table names as VIEWs pointing to `distributed_*` tables
+3. Skips `ON CLUSTER` clauses
+
+This allows SigNoz to work with SharedMergeTree where:
+- `distributed_*` = SharedMergeTree (actual storage, OTEL writes here)
+- Base tables = VIEWs (SigNoz reads here)
+
+### Usage
+
+```bash
+./schema-migrator sync --dsn "tcp://host:9440?secure=true"
+```
+
+---
+## original README.md
+
 ## Why we wrote this?
 
 We initially adopted https://github.com/golang-migrate/migrate to manage the ClickHouse schema migrations. However, we faced the following issues:
