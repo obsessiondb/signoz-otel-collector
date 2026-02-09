@@ -1056,4 +1056,36 @@ var TracesMigrations = []SchemaMigrationRecord{
 			},
 		},
 	},
+	{
+		// Update usage_explorer_mv to use v3 schema (OTEL writes to v3, not v2)
+		MigrationID: 1009,
+		UpItems: []Operation{
+			ModifyQueryMaterializedViewOperation{
+				Database: "signoz_traces",
+				ViewName: "usage_explorer_mv",
+				Query: `SELECT
+							toStartOfHour(timestamp) AS timestamp,
+							resource_string_service$$name AS service_name,
+							count() AS count
+						FROM signoz_traces.signoz_index_v3
+						GROUP BY
+							timestamp,
+							service_name`,
+			},
+		},
+		DownItems: []Operation{
+			ModifyQueryMaterializedViewOperation{
+				Database: "signoz_traces",
+				ViewName: "usage_explorer_mv",
+				Query: `SELECT
+							toStartOfHour(timestamp) AS timestamp,
+							serviceName AS service_name,
+							count() AS count
+						FROM signoz_traces.signoz_index_v2
+						GROUP BY
+							timestamp,
+							serviceName`,
+			},
+		},
+	},
 }
