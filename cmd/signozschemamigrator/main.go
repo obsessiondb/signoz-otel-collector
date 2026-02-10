@@ -35,7 +35,7 @@ func getLogger() *zap.Logger {
 func main() {
 	cmd := &cobra.Command{
 		Use:   "signoz-schema-migrator",
-		Short: "Signoz Schema Migrator",
+		Short: "SigNoz Schema Migrator for ObsessionDB/SharedMergeTree",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			v := viper.New()
 
@@ -56,13 +56,9 @@ func main() {
 	}
 
 	var dsn string
-	var replicationEnabled bool
-	var clusterName string
 	var development bool
 
 	cmd.PersistentFlags().StringVar(&dsn, "dsn", "", "Clickhouse DSN")
-	cmd.PersistentFlags().BoolVar(&replicationEnabled, "replication", false, "Enable replication")
-	cmd.PersistentFlags().StringVar(&clusterName, "cluster-name", "cluster", "Cluster name to use while running migrations")
 	cmd.PersistentFlags().BoolVar(&development, "dev", false, "Development mode")
 
 	registerSyncMigrate(cmd)
@@ -85,11 +81,11 @@ func registerSyncMigrate(cmd *cobra.Command) {
 			logger := getLogger()
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
-			replicationEnabled := strings.ToLower(cmd.Flags().Lookup("replication").Value.String()) == "true"
-			clusterName := cmd.Flags().Lookup("cluster-name").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
 
-			logger.Info("Running migrations in sync mode", zap.String("dsn", dsn), zap.Bool("replication", replicationEnabled), zap.String("cluster-name", clusterName), zap.Bool("enable-logs-migrations-v2", constants.EnableLogsMigrationsV2))
+			logger.Info("Running migrations in sync mode (standalone/SharedMergeTree)",
+				zap.String("dsn", dsn),
+				zap.Bool("enable-logs-migrations-v2", constants.EnableLogsMigrationsV2))
 
 			upVersions := []uint64{}
 			for _, version := range strings.Split(cmd.Flags().Lookup("up").Value.String(), ",") {
@@ -133,9 +129,10 @@ func registerSyncMigrate(cmd *cobra.Command) {
 			}
 			logger.Info("Opened connection")
 
+			// Standalone mode: no cluster, no replication
 			manager, err := schema_migrator.NewMigrationManager(
-				schema_migrator.WithClusterName(clusterName),
-				schema_migrator.WithReplicationEnabled(replicationEnabled),
+				schema_migrator.WithClusterName(""), // Empty = standalone mode
+				schema_migrator.WithReplicationEnabled(false),
 				schema_migrator.WithConn(conn),
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
@@ -183,11 +180,11 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 			logger := getLogger()
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
-			replicationEnabled := strings.ToLower(cmd.Flags().Lookup("replication").Value.String()) == "true"
-			clusterName := cmd.Flags().Lookup("cluster-name").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
 
-			logger.Info("Running migrations in async mode", zap.String("dsn", dsn), zap.Bool("replication", replicationEnabled), zap.String("cluster-name", clusterName), zap.Bool("enable-logs-migrations-v2", constants.EnableLogsMigrationsV2))
+			logger.Info("Running migrations in async mode (standalone/SharedMergeTree)",
+				zap.String("dsn", dsn),
+				zap.Bool("enable-logs-migrations-v2", constants.EnableLogsMigrationsV2))
 
 			upVersions := []uint64{}
 			for _, version := range strings.Split(cmd.Flags().Lookup("up").Value.String(), ",") {
@@ -231,9 +228,10 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 			}
 			logger.Info("Opened connection")
 
+			// Standalone mode: no cluster, no replication
 			manager, err := schema_migrator.NewMigrationManager(
-				schema_migrator.WithClusterName(clusterName),
-				schema_migrator.WithReplicationEnabled(replicationEnabled),
+				schema_migrator.WithClusterName(""), // Empty = standalone mode
+				schema_migrator.WithReplicationEnabled(false),
 				schema_migrator.WithConn(conn),
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
