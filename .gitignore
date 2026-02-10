@@ -24,6 +24,7 @@ vendor/
 .build
 *.rollback
 signoz-collector
+signozschemamigrator
 
 # tmp
 tmp/
