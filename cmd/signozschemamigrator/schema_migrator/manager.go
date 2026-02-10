@@ -417,28 +417,26 @@ func (m *MigrationManager) RunSquashedMigrations(ctx context.Context) error {
 	return nil
 }
 
-// populateBaseToDistributedFromExistingViews scans for existing distributed_* VIEWs
-// and populates the baseToDistributed map. This is needed because on subsequent runs
-// (after crash/restart), the squashed migrations may be skipped, so the map wouldn't
-// be populated from CREATE TABLE operations.
+// populateBaseToDistributedFromExistingViews recovers the baseToDistributed and
+// convertedToViews maps from the actual database state. On restarts, squashed
+// migrations are skipped so these maps would otherwise be empty.
 //
-// In standalone mode:
-// - Base tables (e.g., signoz_index_v3) are SharedMergeTree (actual storage)
-// - Distributed tables (e.g., distributed_signoz_index_v3) are VIEWs pointing to base tables
+// Finds VIEWs like "time_series_v4 AS SELECT * FROM distributed_time_series_v4"
+// and records that time_series_v4 is a VIEW that needs ALTER redirects.
 func (m *MigrationManager) populateBaseToDistributedFromExistingViews(ctx context.Context) error {
 	if m.clusterName != "" {
 		return nil // Only for standalone mode
 	}
 
-	m.logger.Info("Scanning for existing distributed_* VIEWs pointing to base tables")
+	m.logger.Info("Scanning for base table VIEWs pointing to distributed tables")
 
-	// Query all VIEWs in signoz_* databases that start with "distributed_"
+	// Find base table VIEWs (non-distributed_*) that point to distributed_* tables.
 	query := `
 		SELECT database, name, as_select
 		FROM system.tables
 		WHERE engine = 'View'
 		  AND database LIKE 'signoz_%'
-		  AND name LIKE 'distributed_%'
+		  AND name NOT LIKE 'distributed_%'
 	`
 
 	rows, err := m.conn.Query(ctx, query)
@@ -456,31 +454,42 @@ func (m *MigrationManager) populateBaseToDistributedFromExistingViews(ctx contex
 			continue
 		}
 
-		// Extract the base table name from the SELECT
-		// The as_select is like: "SELECT * FROM signoz_traces.signoz_index_v3"
+		// Extract the target table from the SELECT statement
+		// The as_select is like: "SELECT * FROM signoz_metrics.distributed_time_series_v4"
 		asSelectLower := strings.ToLower(asSelect)
 		fromIdx := strings.Index(asSelectLower, " from ")
 		if fromIdx == -1 {
 			continue
 		}
 		afterFrom := strings.TrimSpace(asSelect[fromIdx+6:])
-		// Get the table reference (may have trailing clauses)
 		parts := strings.Fields(afterFrom)
 		if len(parts) == 0 {
 			continue
 		}
-		baseTableRef := parts[0]
+		targetTableRef := parts[0]
 
-		// The VIEW is the distributed table, the SELECT target is the base table
-		distTableKey := database + "." + name
-		m.baseToDistributed[baseTableRef] = distTableKey
-		m.logger.Info("Found existing distributed_* VIEW pointing to base table",
-			zap.String("distributed_view", distTableKey),
-			zap.String("base_table", baseTableRef))
+		// Verify the target is a distributed_* table
+		targetParts := strings.SplitN(targetTableRef, ".", 2)
+		targetTable := targetTableRef
+		if len(targetParts) == 2 {
+			targetTable = targetParts[1]
+		}
+		if !strings.HasPrefix(targetTable, "distributed_") {
+			// Not pointing to a distributed_* table, skip
+			continue
+		}
+
+		// The VIEW is the base table, the SELECT target is the distributed table
+		baseTableKey := database + "." + name
+		m.baseToDistributed[baseTableKey] = targetTableRef
+		m.convertedToViews[baseTableKey] = true
+		m.logger.Info("Found base table VIEW pointing to distributed table",
+			zap.String("base_view", baseTableKey),
+			zap.String("distributed_table", targetTableRef))
 		count++
 	}
 
-	m.logger.Info("Finished scanning existing distributed_* VIEWs", zap.Int("count", count))
+	m.logger.Info("Finished scanning base table VIEWs", zap.Int("count", count))
 	return nil
 }
 
