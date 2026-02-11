@@ -1,39 +1,68 @@
-# Signoz Schema Migrator
+# SigNoz Schema Migrator
 
-This is a tool to manage the ClickHouse schema migrations.
+Fork of the [SigNoz schema migrator](https://github.com/SigNoz/signoz-otel-collector) with **standalone mode** for SharedMergeTree environments ([ObsessionDB](https://obsessiondb.com) and ClickHouse Cloud).
 
 ---
 
-## ObsessionDB / ClickHouse Cloud Fork
+## Why Fork?
 
-This fork adds **standalone mode** for SharedMergeTree environments of [ObsessionDB](https://obsessiondb.com) and ClickHouse Cloud
-
-### Why Fork?
-
-The official schema-migrator creates:
+The upstream migrator assumes a clustered ClickHouse setup:
 - `ReplicatedMergeTree` tables with `ON CLUSTER` (requires ZooKeeper)
-- Separate local + distributed table pairs (not needed with SharedMergeTree)
+- Separate local + distributed table pairs
+- Distributed DDL queue coordination
 
-### What We Changed
+None of this is needed with SharedMergeTree.
 
-**Standalone mode**:
+## What We Changed
 
-1. Creates `SharedMergeTree` tables instead of `ReplicatedMergeTree`
-2. Creates base table names as VIEWs pointing to `distributed_*` tables
-3. Skips `ON CLUSTER` clauses
+We added a **standalone mode** that inverts the table relationship:
 
-This allows SigNoz to work with SharedMergeTree where:
-- `distributed_*` = SharedMergeTree (actual storage, OTEL writes here)
-- Base tables = VIEWs (SigNoz reads here)
+```
+Upstream (Clustered)                          Our Fork (Standalone)
+--------------------                          ----------------------
 
-### Usage
-
-```bash
-./schema-migrator sync --dsn "tcp://host:9440?secure=true"
+Write --> distributed_logs                    Write --> distributed_logs
+            |                                             |
+            | Distributed engine                          | SharedMergeTree  <-- real storage
+            | routes to shards                            |
+            v                                             v
+Read <-- logs                                 Read <-- logs
+            |                                             |
+            | ReplicatedMergeTree                         | VIEW (SELECT * FROM distributed_logs)
+            |                                             |
+            v                                             No ZooKeeper.
+         ZooKeeper                                        No cluster.
+                                                          No coordination.
 ```
 
+Specifically:
+
+1. **`distributed_*` tables become SharedMergeTree** — real storage, the OTEL Collector writes here
+2. **Base table names become VIEWs** — `SELECT * FROM distributed_*`, SigNoz Query Service reads here
+3. **Materialized Views are redirected** to write to `distributed_*` tables (since VIEWs can't receive inserts)
+4. **`ON CLUSTER` clauses are stripped** — no distributed DDL queue
+5. **VIEW mappings are recovered on restart** — existing VIEWs are scanned from `system.tables` so the migrator knows which tables are aliases even when squashed migrations are skipped
+
+## Usage
+
+```bash
+# Run all sync migrations
+./schema-migrator sync --dsn "tcp://host:9440?secure=true"
+
+# Run all async migrations
+./schema-migrator async --dsn "tcp://host:9440?secure=true"
+
+# Run specific migrations
+./schema-migrator sync --dsn "tcp://host:9440?secure=true" --up=1,2,3
+```
+
+For the full ObsessionDB + SigNoz setup, see [obsessiondb/signoz-obsessiondb](https://github.com/obsessiondb/signoz-obsessiondb).
+
 ---
-## original README.md
+
+## Original upstream README
+
+> **Note:** The `--cluster-name` and `--replication` flags referenced below do not exist in this fork. They have been replaced by hardcoded standalone mode. The upstream documentation is preserved here for context on the migration engine design.
 
 ## Why we wrote this?
 
