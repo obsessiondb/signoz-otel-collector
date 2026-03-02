@@ -609,9 +609,10 @@ func (m *MigrationManager) ConvertBaseTablesToViews(ctx context.Context) error {
 	return nil
 }
 
-// RecreateMaterializedViewsForStandalone recreates MVs to write to distributed_* tables.
-// In standalone mode, base tables are converted to VIEWs, which can't receive INSERTs.
-// So MVs need to write directly to distributed_* tables instead.
+// RecreateMaterializedViewsForStandalone recreates MVs to fix both TO and FROM clauses.
+// In standalone mode:
+// - TO clause: MVs must write to distributed_* tables (not VIEWs)
+// - FROM clause: MVs must read from distributed_* tables (VIEWs don't trigger on INSERT)
 func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Context) error {
 	if m.clusterName != "" {
 		return nil // Only for standalone mode
@@ -619,40 +620,12 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 
 	m.logger.Info("Recreating Materialized Views for standalone mode")
 
-	// Query all materialized views that write to base tables (not distributed_*)
-	query := `
-		SELECT database, name, as_select, engine_full
-		FROM system.tables
-		WHERE engine = 'MaterializedView'
-		  AND database LIKE 'signoz_%'
-		  AND engine_full NOT LIKE '%distributed_%'
-	`
-
-	rows, err := m.conn.Query(ctx, query)
-	if err != nil {
-		m.logger.Error("Failed to query materialized views", zap.Error(err))
-		return err
-	}
-	defer rows.Close()
-
 	type mvInfo struct {
 		Database   string
 		Name       string
 		AsSelect   string
 		EngineFull string
 	}
-
-	var mvsToRecreate []mvInfo
-	for rows.Next() {
-		var mv mvInfo
-		if err := rows.Scan(&mv.Database, &mv.Name, &mv.AsSelect, &mv.EngineFull); err != nil {
-			m.logger.Error("Failed to scan MV row", zap.Error(err))
-			return err
-		}
-		mvsToRecreate = append(mvsToRecreate, mv)
-	}
-
-	m.logger.Info("Found MVs to recreate", zap.Int("count", len(mvsToRecreate)))
 
 	// Fallback mapping for MVs when engine_full is empty (ClickHouse Cloud)
 	mvToDestTable := map[string]string{
@@ -682,19 +655,44 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 		"resource_keys_string_final_mv":   "signoz_logs.logs_resource_keys",
 	}
 
-	for _, mv := range mvsToRecreate {
-		// Parse the destination table from engine_full (e.g., "MaterializedView(...) TO signoz_metrics.time_series_v4_6hrs")
-		// The engine_full contains the destination table info
+	// Query ALL materialized views in signoz databases
+	query := `
+		SELECT database, name, as_select, engine_full
+		FROM system.tables
+		WHERE engine = 'MaterializedView'
+		  AND database LIKE 'signoz_%'
+	`
+
+	rows, err := m.conn.Query(ctx, query)
+	if err != nil {
+		m.logger.Error("Failed to query materialized views", zap.Error(err))
+		return err
+	}
+	defer rows.Close()
+
+	var allMVs []mvInfo
+	for rows.Next() {
+		var mv mvInfo
+		if err := rows.Scan(&mv.Database, &mv.Name, &mv.AsSelect, &mv.EngineFull); err != nil {
+			m.logger.Error("Failed to scan MV row", zap.Error(err))
+			return err
+		}
+		allMVs = append(allMVs, mv)
+	}
+
+	m.logger.Info("Found total MVs to check", zap.Int("count", len(allMVs)))
+
+	for _, mv := range allMVs {
+		// Parse the destination table from engine_full
 		destTable := ""
 		if idx := strings.Index(mv.EngineFull, " TO "); idx != -1 {
 			destTable = strings.TrimSpace(mv.EngineFull[idx+4:])
-			// Remove any trailing parts after the table name
 			if spaceIdx := strings.Index(destTable, " "); spaceIdx != -1 {
 				destTable = destTable[:spaceIdx]
 			}
 		}
 
-		// Fallback: use known mapping if engine_full is empty (ClickHouse Cloud)
+		// Fallback: use known mapping if engine_full is empty
 		if destTable == "" {
 			if dest, ok := mvToDestTable[mv.Name]; ok {
 				destTable = dest
@@ -708,36 +706,43 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 			continue
 		}
 
-		// Extract database and table name from destTable
-		parts := strings.Split(destTable, ".")
-		if len(parts) != 2 {
-			m.logger.Warn("Invalid destination table format", zap.String("dest", destTable))
-			continue
-		}
-		destDB := parts[0]
-		destTableName := parts[1]
-
-		// Skip if already pointing to distributed_*
-		if strings.HasPrefix(destTableName, "distributed_") {
-			continue
-		}
-
-		// Build the new destination table name
-		newDestTable := fmt.Sprintf("%s.distributed_%s", destDB, destTableName)
-
-		// Check if the distributed table exists
-		existsQuery := fmt.Sprintf("EXISTS %s", newDestTable)
-		var exists uint8
-		if err := m.conn.QueryRow(ctx, existsQuery).Scan(&exists); err != nil || exists != 1 {
-			m.logger.Warn("Distributed table does not exist, skipping MV recreation",
-				zap.String("mv", mv.Name), zap.String("distributed_table", newDestTable))
-			continue
+		// Determine if TO clause needs fixing
+		needsToFix := false
+		newDestTable := destTable
+		destParts := strings.Split(destTable, ".")
+		if len(destParts) == 2 && !strings.HasPrefix(destParts[1], "distributed_") {
+			candidate := fmt.Sprintf("%s.distributed_%s", destParts[0], destParts[1])
+			existsQuery := fmt.Sprintf("EXISTS %s", candidate)
+			var exists uint8
+			if err := m.conn.QueryRow(ctx, existsQuery).Scan(&exists); err == nil && exists == 1 {
+				needsToFix = true
+				newDestTable = candidate
+			}
 		}
 
-		m.logger.Info("Recreating MV to write to distributed table",
+		// Determine if FROM clause needs fixing (as_select references base table VIEWs)
+		needsFromFix := false
+		rewrittenSelect := mv.AsSelect
+		for baseKey, distKey := range m.baseToDistributed {
+			if strings.Contains(rewrittenSelect, baseKey) {
+				needsFromFix = true
+				m.logger.Info("Standalone mode: rewriting MV FROM clause in recreation",
+					zap.String("mv", mv.Name),
+					zap.String("old_ref", baseKey),
+					zap.String("new_ref", distKey))
+				rewrittenSelect = strings.ReplaceAll(rewrittenSelect, baseKey, distKey)
+			}
+		}
+
+		if !needsToFix && !needsFromFix {
+			continue
+		}
+
+		m.logger.Info("Recreating MV for standalone mode",
 			zap.String("mv", mv.Database+"."+mv.Name),
-			zap.String("old_dest", destTable),
-			zap.String("new_dest", newDestTable))
+			zap.Bool("to_fix", needsToFix),
+			zap.Bool("from_fix", needsFromFix),
+			zap.String("dest", newDestTable))
 
 		// Drop the old MV
 		dropSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s", mv.Database, mv.Name)
@@ -747,9 +752,9 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 			return err
 		}
 
-		// Recreate the MV with the new destination
+		// Recreate the MV with fixed TO and FROM
 		createSQL := fmt.Sprintf("CREATE MATERIALIZED VIEW %s.%s TO %s AS %s",
-			mv.Database, mv.Name, newDestTable, mv.AsSelect)
+			mv.Database, mv.Name, newDestTable, rewrittenSelect)
 		m.logger.Info("Creating new MV", zap.String("sql", createSQL))
 		if err := m.conn.Exec(ctx, createSQL); err != nil {
 			m.logger.Error("Failed to create MV", zap.Error(err), zap.String("mv", mv.Name))
@@ -1521,6 +1526,35 @@ func (m *MigrationManager) RunOperation(ctx context.Context, operation Operation
 		operation = operation.WithReplication()
 	}
 
+	// In standalone mode, rewrite ModifyQueryMaterializedViewOperation FROM clauses
+	// Handle this before the ALTER TABLE switch because it needs FROM rewriting, not skip/redirect
+	if m.clusterName == "" {
+		switch op := operation.(type) {
+		case *ModifyQueryMaterializedViewOperation:
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(op.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting ModifyQuery FROM clause",
+						zap.String("mv", op.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					op.Query = strings.ReplaceAll(op.Query, baseKey, distKey)
+				}
+			}
+			sql = op.ToSQL()
+		case ModifyQueryMaterializedViewOperation:
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(op.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting ModifyQuery FROM clause",
+						zap.String("mv", op.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					op.Query = strings.ReplaceAll(op.Query, baseKey, distKey)
+				}
+			}
+			sql = op.ToSQL()
+		}
+	}
+
 	// In standalone mode, skip ALTER TABLE operations on tables that have been converted to VIEWs
 	// The distributed_* table gets altered anyway, and the VIEW auto-reflects schema changes
 	if m.clusterName == "" {
@@ -1933,6 +1967,21 @@ func (m *MigrationManager) RunOperation(ctx context.Context, operation Operation
 					sql = mvOp.ToSQL()
 				}
 			}
+
+			// Rewrite FROM clause: replace VIEW table names with real distributed_ tables
+			// MV queries use fully-qualified names (e.g., signoz_metrics.samples_v4), so
+			// replacing with the fully-qualified distributed_ name is safe (no substring collisions)
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(mvOp.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting MV FROM clause",
+						zap.String("mv", mvOp.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					mvOp.Query = strings.ReplaceAll(mvOp.Query, baseKey, distKey)
+				}
+			}
+			// Regenerate SQL with rewritten query
+			sql = mvOp.ToSQL()
 		}
 	}
 
@@ -2080,6 +2129,34 @@ func (m *MigrationManager) RunOperationWithoutUpdate(ctx context.Context, operat
 
 	if m.replicationEnabled {
 		operation = operation.WithReplication()
+	}
+
+	// In standalone mode, rewrite ModifyQueryMaterializedViewOperation FROM clauses
+	if m.clusterName == "" {
+		switch op := operation.(type) {
+		case *ModifyQueryMaterializedViewOperation:
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(op.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting ModifyQuery FROM clause",
+						zap.String("mv", op.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					op.Query = strings.ReplaceAll(op.Query, baseKey, distKey)
+				}
+			}
+			sql = op.ToSQL()
+		case ModifyQueryMaterializedViewOperation:
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(op.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting ModifyQuery FROM clause",
+						zap.String("mv", op.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					op.Query = strings.ReplaceAll(op.Query, baseKey, distKey)
+				}
+			}
+			sql = op.ToSQL()
+		}
 	}
 
 	// In standalone mode, skip ALTER TABLE operations on tables that have been converted to VIEWs
@@ -2471,6 +2548,21 @@ func (m *MigrationManager) RunOperationWithoutUpdate(ctx context.Context, operat
 					sql = mvOp.ToSQL()
 				}
 			}
+
+			// Rewrite FROM clause: replace VIEW table names with real distributed_ tables
+			// MV queries use fully-qualified names (e.g., signoz_metrics.samples_v4), so
+			// replacing with the fully-qualified distributed_ name is safe (no substring collisions)
+			for baseKey, distKey := range m.baseToDistributed {
+				if strings.Contains(mvOp.Query, baseKey) {
+					m.logger.Info("Standalone mode: rewriting MV FROM clause",
+						zap.String("mv", mvOp.ViewName),
+						zap.String("old_ref", baseKey),
+						zap.String("new_ref", distKey))
+					mvOp.Query = strings.ReplaceAll(mvOp.Query, baseKey, distKey)
+				}
+			}
+			// Regenerate SQL with rewritten query
+			sql = mvOp.ToSQL()
 		}
 	}
 

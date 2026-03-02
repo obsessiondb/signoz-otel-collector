@@ -155,10 +155,19 @@ func registerSyncMigrate(cmd *cobra.Command) {
 
 			if len(downVersions) != 0 {
 				logger.Info("Migrating down")
-				return manager.MigrateDownSync(context.Background(), downVersions)
+				if err := manager.MigrateDownSync(context.Background(), downVersions); err != nil {
+					return err
+				}
+			} else {
+				logger.Info("Migrating up")
+				if err := manager.MigrateUpSync(context.Background(), upVersions); err != nil {
+					return err
+				}
 			}
-			logger.Info("Migrating up")
-			return manager.MigrateUpSync(context.Background(), upVersions)
+
+			// Post-migration: fix any MVs with broken TO or FROM clauses (self-heal existing deployments)
+			logger.Info("Running post-migration MV repair for standalone mode")
+			return manager.RecreateMaterializedViewsForStandalone(context.Background())
 		},
 	}
 
@@ -243,10 +252,19 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 
 			if len(downVersions) != 0 {
 				logger.Info("Migrating down")
-				return manager.MigrateDownAsync(context.Background(), downVersions)
+				if err := manager.MigrateDownAsync(context.Background(), downVersions); err != nil {
+					return err
+				}
+			} else {
+				logger.Info("Migrating up")
+				if err := manager.MigrateUpAsync(context.Background(), upVersions); err != nil {
+					return err
+				}
 			}
-			logger.Info("Migrating up")
-			return manager.MigrateUpAsync(context.Background(), upVersions)
+
+			// Post-migration: fix any MVs with broken TO or FROM clauses (self-heal existing deployments)
+			logger.Info("Running post-migration MV repair for standalone mode")
+			return manager.RecreateMaterializedViewsForStandalone(context.Background())
 		},
 	}
 
