@@ -653,6 +653,7 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 		"attribute_keys_float64_final_mv": "signoz_logs.logs_attribute_keys",
 		"attribute_keys_bool_final_mv":    "signoz_logs.logs_attribute_keys",
 		"resource_keys_string_final_mv":   "signoz_logs.logs_resource_keys",
+		"samples_agg_1d_mv":              "signoz_meter.distributed_samples_agg_1d",
 	}
 
 	// Query ALL materialized views in signoz databases
@@ -702,8 +703,8 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 		}
 
 		if destTable == "" {
-			m.logger.Warn("Could not parse destination table from MV", zap.String("mv", mv.Name), zap.String("engine_full", mv.EngineFull))
-			continue
+			m.logger.Warn("Could not parse destination table from MV, will still check FROM clause",
+				zap.String("mv", mv.Name), zap.String("engine_full", mv.EngineFull))
 		}
 
 		// Determine if TO clause needs fixing
@@ -735,6 +736,13 @@ func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Co
 		}
 
 		if !needsToFix && !needsFromFix {
+			continue
+		}
+
+		// Can't recreate without a destination table
+		if newDestTable == "" {
+			m.logger.Warn("MV needs FROM fix but destination table unknown, skipping",
+				zap.String("mv", mv.Database+"."+mv.Name))
 			continue
 		}
 
