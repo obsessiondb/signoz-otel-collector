@@ -975,4 +975,28 @@ var MetricsMigrations = []SchemaMigrationRecord{
 			},
 		},
 	},
+	{
+		MigrationID: 1008,
+		UpItems: []Operation{
+			// Ensure projections are rebuilt correctly during merges in SharedMergeTree.
+			// Without this, merging parts with projections throws an error instead of rebuilding.
+			// Target base tables only: in standalone mode the migrator redirects these ALTERs to
+			// the distributed_* counterparts (the actual SharedMergeTree storage). In clustered
+			// mode they apply directly to the ReplicatedMergeTree base tables.
+			AlterTableModifySettings{
+				Database: "signoz_metrics",
+				Table:    "samples_v4",
+				Settings: TableSettings{
+					{Name: "deduplicate_merge_projection_mode", Value: "'rebuild'"},
+				},
+			},
+			AlterTableModifySettings{
+				Database: "signoz_metrics",
+				Table:    "time_series_v4",
+				Settings: TableSettings{
+					{Name: "deduplicate_merge_projection_mode", Value: "'rebuild'"},
+				},
+			},
+		},
+	},
 }

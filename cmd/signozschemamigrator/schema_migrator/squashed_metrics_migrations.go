@@ -199,6 +199,12 @@ var (
 						{Name: "unix_milli", Type: ColumnTypeInt64, Codec: "DoubleDelta, ZSTD(1)"},
 						{Name: "value", Type: ColumnTypeFloat64, Codec: "Gorilla, ZSTD(1)"},
 					},
+					Projections: []Projection{
+						{
+							Name:  "proj_last_received",
+							Query: "SELECT metric_name, max(unix_milli) GROUP BY metric_name",
+						},
+					},
 					Engine: MergeTree{
 						PartitionBy: "toDate(unix_milli / 1000)",
 						OrderBy:     "(env, temporality, metric_name, fingerprint, unix_milli)",
@@ -206,6 +212,7 @@ var (
 						Settings: TableSettings{
 							{Name: "index_granularity", Value: "8192"},
 							{Name: "ttl_only_drop_parts", Value: "1"},
+							{Name: "deduplicate_merge_projection_mode", Value: "'rebuild'"},
 						},
 					},
 				},
@@ -263,6 +270,12 @@ var (
 						{Name: "unix_milli", Type: ColumnTypeInt64, Codec: "Delta(8), ZSTD(1)"},
 						{Name: "labels", Type: ColumnTypeString, Codec: "ZSTD(5)"},
 					},
+					Projections: []Projection{
+						{
+							Name:  "proj_metric_name",
+							Query: "SELECT * ORDER BY metric_name, fingerprint, unix_milli",
+						},
+					},
 					Engine: ReplacingMergeTree{
 						MergeTree{
 							PartitionBy: "toDate(unix_milli / 1000)",
@@ -271,6 +284,7 @@ var (
 							Settings: TableSettings{
 								{Name: "index_granularity", Value: "8192"},
 								{Name: "ttl_only_drop_parts", Value: "1"},
+								{Name: "deduplicate_merge_projection_mode", Value: "'rebuild'"},
 							},
 						},
 					},
