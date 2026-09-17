@@ -67,11 +67,21 @@ type expectedMV struct {
 
 func (e expectedMV) fqName() string { return e.Database + "." + e.Name }
 
+// mvExpectations is what the migrations sync runs leave behind.
+type mvExpectations struct {
+	// Present are the MVs that must exist, each with the query of the last
+	// migration that touched it.
+	Present []expectedMV
+	// Dropped are MVs (by fully qualified name) a migration removes. Drops run
+	// in the async phase, which a deployment may never run, so these can still
+	// exist: the repair neither touches nor requires them.
+	Dropped map[string]bool
+}
+
 // expectedMVs replays, per database, the migration lists sync runs, in the
-// order it runs them, and returns the MVs that must exist afterwards — each
-// with the query of the last migration that touched it. Deriving this from the
-// migrations keeps it right when upstream adds, modifies or drops an MV.
-func expectedMVs() []expectedMV {
+// order it runs them. Deriving this from the migrations keeps it right when
+// upstream adds, modifies or drops an MV.
+func expectedMVs() mvExpectations {
 	logsMigrations := LogsMigrations
 	if constants.EnableLogsMigrationsV2 {
 		logsMigrations = LogsMigrationsV2
@@ -89,26 +99,31 @@ func expectedMVs() []expectedMV {
 		{SignozMeterDB, [][]SchemaMigrationRecord{MeterMigrations}},
 	}
 
-	var out []expectedMV
+	out := mvExpectations{Dropped: map[string]bool{}}
 	for _, db := range perDatabase {
 		var records []SchemaMigrationRecord
 		for _, list := range db.lists {
 			records = append(records, list...)
 		}
-		out = append(out, replayMaterializedViews(db.database, records)...)
+		replayed := replayMaterializedViews(db.database, records)
+		out.Present = append(out.Present, replayed.Present...)
+		for name := range replayed.Dropped {
+			out.Dropped[name] = true
+		}
 	}
 	return out
 }
 
-func (m *MigrationManager) expectedMaterializedViews() []expectedMV {
+func (m *MigrationManager) expectedMaterializedViews() mvExpectations {
 	if m.mvExpected != nil {
 		return m.mvExpected()
 	}
 	return expectedMVs()
 }
 
-func replayMaterializedViews(database string, records []SchemaMigrationRecord) []expectedMV {
+func replayMaterializedViews(database string, records []SchemaMigrationRecord) mvExpectations {
 	byName := map[string]*expectedMV{}
+	dropped := map[string]bool{}
 	for _, record := range records {
 		if isSkippedInStandaloneMode(database, record.MigrationID) {
 			continue
@@ -116,30 +131,30 @@ func replayMaterializedViews(database string, records []SchemaMigrationRecord) [
 		for _, item := range record.UpItems {
 			switch op := item.(type) {
 			case CreateMaterializedViewOperation:
-				replayCreate(byName, database, op)
+				replayCreate(byName, dropped, database, op)
 			case *CreateMaterializedViewOperation:
-				replayCreate(byName, database, *op)
+				replayCreate(byName, dropped, database, *op)
 			case ModifyQueryMaterializedViewOperation:
 				replayModify(byName, database, op)
 			case *ModifyQueryMaterializedViewOperation:
 				replayModify(byName, database, *op)
 			case DropTableOperation:
-				replayDrop(byName, database, op)
+				replayDrop(byName, dropped, database, op)
 			case *DropTableOperation:
-				replayDrop(byName, database, *op)
+				replayDrop(byName, dropped, database, *op)
 			}
 		}
 	}
 
-	out := make([]expectedMV, 0, len(byName))
+	out := mvExpectations{Dropped: dropped}
 	for _, mv := range byName {
-		out = append(out, *mv)
+		out.Present = append(out.Present, *mv)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	sort.Slice(out.Present, func(i, j int) bool { return out.Present[i].Name < out.Present[j].Name })
 	return out
 }
 
-func replayCreate(byName map[string]*expectedMV, database string, op CreateMaterializedViewOperation) {
+func replayCreate(byName map[string]*expectedMV, dropped map[string]bool, database string, op CreateMaterializedViewOperation) {
 	if op.Database != database {
 		return
 	}
@@ -149,6 +164,7 @@ func replayCreate(byName map[string]*expectedMV, database string, op CreateMater
 		DestTable: op.DestTable,
 		Query:     cleanQuery(op.Query),
 	}
+	delete(dropped, op.Database+"."+op.ViewName)
 }
 
 func replayModify(byName map[string]*expectedMV, database string, op ModifyQueryMaterializedViewOperation) {
@@ -160,11 +176,12 @@ func replayModify(byName map[string]*expectedMV, database string, op ModifyQuery
 	}
 }
 
-func replayDrop(byName map[string]*expectedMV, database string, op DropTableOperation) {
+func replayDrop(byName map[string]*expectedMV, dropped map[string]bool, database string, op DropTableOperation) {
 	if op.Database != database {
 		return
 	}
 	delete(byName, op.Table)
+	dropped[op.Database+"."+op.Table] = true
 }
 
 func cleanQuery(q string) string {
@@ -356,7 +373,7 @@ func synthesizeMV(database, name, target, body string) signozTable {
 // catalog. Only MVs that are provably wrong get an action — the target is an
 // alias VIEW, the body reads one, or the MV is missing — and MVs that are not
 // expected are never dropped.
-func planStandaloneMVs(tables map[string]signozTable, expected []expectedMV) mvPlan {
+func planStandaloneMVs(tables map[string]signozTable, expected mvExpectations) mvPlan {
 	sim := make(map[string]signozTable, len(tables))
 	for k, v := range tables {
 		sim[k] = v
@@ -367,7 +384,7 @@ func planStandaloneMVs(tables map[string]signozTable, expected []expectedMV) mvP
 
 	for _, key := range sortedKeys(tables) {
 		mv := tables[key]
-		if !mv.isMaterializedView() {
+		if !mv.isMaterializedView() || expected.Dropped[key] {
 			continue
 		}
 		target := parseMVTarget(mv.Database, mv.CreateTableQuery)
@@ -404,7 +421,7 @@ func planStandaloneMVs(tables map[string]signozTable, expected []expectedMV) mvP
 		}
 	}
 
-	for _, e := range expected {
+	for _, e := range expected.Present {
 		if _, ok := sim[e.fqName()]; ok {
 			continue
 		}
@@ -434,11 +451,11 @@ func planStandaloneMVs(tables map[string]signozTable, expected []expectedMV) mvP
 // validateMaterializedViews returns every way the MVs are broken: an expected
 // MV is missing, an MV writes to something that is not storage, or an MV reads
 // an alias VIEW and therefore never fires.
-func validateMaterializedViews(tables map[string]signozTable, expected []expectedMV) []string {
+func validateMaterializedViews(tables map[string]signozTable, expected mvExpectations) []string {
 	aliases := buildViewAliases(tables)
 	var problems []string
 
-	for _, e := range expected {
+	for _, e := range expected.Present {
 		if _, ok := tables[e.fqName()]; !ok {
 			problems = append(problems, fmt.Sprintf("%s is missing", e.fqName()))
 		}
@@ -446,7 +463,7 @@ func validateMaterializedViews(tables map[string]signozTable, expected []expecte
 
 	for _, key := range sortedKeys(tables) {
 		mv := tables[key]
-		if !mv.isMaterializedView() {
+		if !mv.isMaterializedView() || expected.Dropped[key] {
 			continue
 		}
 		target := parseMVTarget(mv.Database, mv.CreateTableQuery)
@@ -527,6 +544,13 @@ func (m *MigrationManager) CheckMaterializedViewsForStandalone(ctx context.Conte
 	report := MVCheckReport{Problems: validateMaterializedViews(plan.Simulated, expected)}
 	for _, a := range plan.Actions {
 		report.Actions = append(report.Actions, a.String())
+		if !a.runsSelect() {
+			continue
+		}
+		if err := m.checkSelect(ctx, a.Select); err != nil {
+			report.Problems = append(report.Problems,
+				fmt.Sprintf("%s: the SELECT it would get does not analyze: %v", a.fqName(), err))
+		}
 	}
 	return report, nil
 }
@@ -608,6 +632,14 @@ func (m *MigrationManager) executeMVAction(ctx context.Context, a mvAction) erro
 	fq := a.fqName()
 	m.logger.Info("Materialized view repair", zap.String("action", a.String()))
 
+	// Before any DDL — including the DROP of a rebuild — so a SELECT that
+	// cannot run leaves everything exactly as it was.
+	if a.runsSelect() {
+		if err := m.checkSelect(ctx, a.Select); err != nil {
+			return fmt.Errorf("%s: the new SELECT does not analyze, nothing was changed: %w", fq, err)
+		}
+	}
+
 	switch a.Kind {
 	case mvActionModifyQuery:
 		return m.execMV(ctx, ModifyQueryMaterializedViewOperation{
@@ -629,6 +661,33 @@ func (m *MigrationManager) executeMVAction(ctx context.Context, a mvAction) erro
 		return fmt.Errorf("%s cannot be repaired: %s", fq, a.Reason)
 	}
 	return fmt.Errorf("unknown materialized view action %q for %s", a.Kind, fq)
+}
+
+func (a mvAction) runsSelect() bool {
+	return a.Kind == mvActionModifyQuery || a.Kind == mvActionRebuild || a.Kind == mvActionRecreate
+}
+
+// checkSelect has ClickHouse analyze a SELECT without running it. Depending on
+// allow_materialized_view_with_bad_select, an MV whose SELECT references a
+// missing column can still be created, and then every INSERT into its source
+// fails. So no MV DDL runs until its SELECT passes this.
+func (m *MigrationManager) checkSelect(ctx context.Context, body string) error {
+	rows, err := m.conn.Query(ctx, "DESCRIBE ("+body+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns := 0
+	for rows.Next() {
+		columns++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if columns == 0 {
+		return errors.New("DESCRIBE returned no columns")
+	}
+	return nil
 }
 
 func (m *MigrationManager) createMV(ctx context.Context, a mvAction) error {

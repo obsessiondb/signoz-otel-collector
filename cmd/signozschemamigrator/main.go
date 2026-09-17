@@ -62,7 +62,8 @@ func main() {
 	cmd.PersistentFlags().StringVar(&dsn, "dsn", "", "Clickhouse DSN")
 	cmd.PersistentFlags().BoolVar(&development, "dev", false, "Development mode")
 	cmd.PersistentFlags().StringVar(&mvGate, "mv-gate", "fail",
-		"What a materialized view left misconfigured does to sync/async: fail, or warn (break-glass only)")
+		"Materialized view repair at the end of sync/async: fail (default) fails on problems left; "+
+			"warn logs them instead; off skips the repair and the check entirely. warn and off are break-glass only")
 
 	registerSyncMigrate(cmd)
 	registerAsyncMigrate(cmd)
@@ -86,7 +87,7 @@ func registerSyncMigrate(cmd *cobra.Command) {
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
-			warnOnly, err := mvGateWarnOnly(cmd)
+			gate, err := mvGateMode(cmd)
 			if err != nil {
 				return err
 			}
@@ -145,7 +146,7 @@ func registerSyncMigrate(cmd *cobra.Command) {
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
 				schema_migrator.WithDevelopment(development),
-				schema_migrator.WithMVGateWarnOnly(warnOnly),
+				schema_migrator.WithMVGateWarnOnly(gate == "warn"),
 			)
 			if err != nil {
 				return fmt.Errorf("failed to create migration manager: %w", err)
@@ -180,6 +181,10 @@ func registerSyncMigrate(cmd *cobra.Command) {
 				logger.Info("Skipping materialized view repair for an explicit --up/--down run")
 				return nil
 			}
+			if gate == "off" {
+				logger.Warn("Materialized view repair and check are disabled (--mv-gate=off)")
+				return nil
+			}
 			logger.Info("Running post-migration MV repair for standalone mode")
 			return manager.RecreateMaterializedViewsForStandalone(context.Background())
 		},
@@ -204,7 +209,7 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
-			warnOnly, err := mvGateWarnOnly(cmd)
+			gate, err := mvGateMode(cmd)
 			if err != nil {
 				return err
 			}
@@ -263,7 +268,7 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
 				schema_migrator.WithDevelopment(development),
-				schema_migrator.WithMVGateWarnOnly(warnOnly),
+				schema_migrator.WithMVGateWarnOnly(gate == "warn"),
 			)
 			if err != nil {
 				return fmt.Errorf("failed to create migration manager: %w", err)
@@ -285,6 +290,10 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 			// catalog is intentionally not at the state every migration leaves.
 			if len(upVersions) != 0 || len(downVersions) != 0 {
 				logger.Info("Skipping materialized view repair for an explicit --up/--down run")
+				return nil
+			}
+			if gate == "off" {
+				logger.Warn("Materialized view repair and check are disabled (--mv-gate=off)")
 				return nil
 			}
 			logger.Info("Running post-migration MV repair for standalone mode")
@@ -356,13 +365,11 @@ func registerCheckMVs(cmd *cobra.Command) {
 	cmd.AddCommand(checkCmd)
 }
 
-func mvGateWarnOnly(cmd *cobra.Command) (bool, error) {
+func mvGateMode(cmd *cobra.Command) (string, error) {
 	switch mode := cmd.Flags().Lookup("mv-gate").Value.String(); mode {
-	case "fail":
-		return false, nil
-	case "warn":
-		return true, nil
+	case "fail", "warn", "off":
+		return mode, nil
 	default:
-		return false, fmt.Errorf("invalid --mv-gate %q: want fail or warn", mode)
+		return "", fmt.Errorf("invalid --mv-gate %q: want fail, warn or off", mode)
 	}
 }

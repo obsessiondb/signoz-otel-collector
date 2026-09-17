@@ -56,7 +56,7 @@ func catalogOf(tables ...signozTable) map[string]signozTable {
 
 func expectedIn(db string) []expectedMV {
 	var out []expectedMV
-	for _, e := range expectedMVs() {
+	for _, e := range expectedMVs().Present {
 		if e.Database == db {
 			out = append(out, e)
 		}
@@ -66,9 +66,14 @@ func expectedIn(db string) []expectedMV {
 
 func expectedTraces() []expectedMV { return expectedIn(traces) }
 
+// tracesOnly expects the trace MVs and honours every migration's drops.
+func tracesOnly() mvExpectations {
+	return mvExpectations{Present: expectedTraces(), Dropped: expectedMVs().Dropped}
+}
+
 func expectedByName(t *testing.T, name string) expectedMV {
 	t.Helper()
-	for _, e := range expectedMVs() {
+	for _, e := range expectedMVs().Present {
 		if e.Name == name {
 			return e
 		}
@@ -160,7 +165,17 @@ func TestExpectedMVs(t *testing.T) {
 	require.Empty(t, expectedNames(SignozMetadataDB))
 	require.Empty(t, expectedNames(SignozAnalyticsDB))
 
-	for _, e := range expectedMVs() {
+	dropped := expectedMVs().Dropped
+	for _, name := range []string{
+		"signoz_traces.durationSortMV",
+		"signoz_metrics.time_series_v4_6hrs_mv_separate_attrs",
+		"signoz_logs.attribute_keys_string_final_mv",
+	} {
+		require.True(t, dropped[name], "%s is dropped by a migration", name)
+	}
+	require.False(t, dropped["signoz_traces.trace_summary_mv"])
+
+	for _, e := range expectedMVs().Present {
 		require.False(t, strings.HasSuffix(e.Query, ";"), "%s keeps a trailing semicolon", e.fqName())
 		require.NotEmpty(t, e.DestTable, e.fqName())
 	}
@@ -192,15 +207,23 @@ func TestReplayMaterializedViews(t *testing.T) {
 			ModifyQueryMaterializedViewOperation{Database: "db", ViewName: "never_created", Query: "SELECT 0 FROM db.s"},
 		}},
 	}
-	require.Equal(t,
-		[]expectedMV{{Database: "db", Name: "a", DestTable: "t", Query: "SELECT 10 FROM db.s"}},
-		replayMaterializedViews("db", records))
+	got := replayMaterializedViews("db", records)
+	require.Equal(t, []expectedMV{{Database: "db", Name: "a", DestTable: "t", Query: "SELECT 10 FROM db.s"}}, got.Present)
+	require.Equal(t, map[string]bool{"db.b": true}, got.Dropped)
+
+	// A later CREATE brings a dropped MV back.
+	recreated := append(records, SchemaMigrationRecord{MigrationID: 3, UpItems: []Operation{
+		CreateMaterializedViewOperation{Database: "db", ViewName: "b", DestTable: "t", Query: "SELECT 3 FROM db.s"},
+	}})
+	got = replayMaterializedViews("db", recreated)
+	require.Len(t, got.Present, 2)
+	require.Empty(t, got.Dropped)
 
 	// Migrations standalone mode never runs contribute nothing.
 	skipped := []SchemaMigrationRecord{{MigrationID: 1008, UpItems: []Operation{
 		CreateMaterializedViewOperation{Database: traces, ViewName: "x", DestTable: "t", Query: "SELECT 1 FROM signoz_traces.s"},
 	}}}
-	require.Empty(t, replayMaterializedViews(traces, skipped))
+	require.Empty(t, replayMaterializedViews(traces, skipped).Present)
 }
 
 func TestParseMVTarget(t *testing.T) {
@@ -362,19 +385,19 @@ func TestBuildViewAliases(t *testing.T) {
 
 func TestPlanStandaloneMVs(t *testing.T) {
 	t.Run("a-healthy-catalog-needs-nothing", func(t *testing.T) {
-		require.Empty(t, planStandaloneMVs(healthyCatalog(t), expectedTraces()).Actions)
+		require.Empty(t, planStandaloneMVs(healthyCatalog(t), tracesOnly()).Actions)
 	})
 
 	t.Run("an-mv-writing-to-an-alias-view-is-rebuilt-onto-storage", func(t *testing.T) {
 		// The incident: usage_explorer_mv pointed at distributed_usage_explorer,
 		// which in this layout is the VIEW, not the table.
-		plan := planStandaloneMVs(brokenUsageCatalog(t), expectedTraces())
+		plan := planStandaloneMVs(brokenUsageCatalog(t), tracesOnly())
 		e := expectedByName(t, "usage_explorer_mv")
 		require.Equal(t, []mvAction{{
 			Kind: mvActionRebuild, Database: traces, Name: e.Name,
 			Target: traces + ".usage_explorer", Select: correctBody(e),
 		}}, plan.Actions)
-		require.Empty(t, validateMaterializedViews(plan.Simulated, expectedTraces()))
+		require.Empty(t, validateMaterializedViews(plan.Simulated, tracesOnly()))
 	})
 
 	t.Run("an-mv-reading-an-alias-view-gets-its-query-modified", func(t *testing.T) {
@@ -382,15 +405,15 @@ func TestPlanStandaloneMVs(t *testing.T) {
 		e := expectedByName(t, "root_operations")
 		tables[e.fqName()] = materializedView(traces, e.Name, traces+".distributed_top_level_operations", e.Query)
 
-		plan := planStandaloneMVs(tables, expectedTraces())
+		plan := planStandaloneMVs(tables, tracesOnly())
 		require.Len(t, plan.Actions, 1)
 		require.Equal(t, mvActionModifyQuery, plan.Actions[0].Kind)
 		require.Equal(t, correctBody(e), plan.Actions[0].Select)
-		require.Empty(t, validateMaterializedViews(plan.Simulated, expectedTraces()))
+		require.Empty(t, validateMaterializedViews(plan.Simulated, tracesOnly()))
 	})
 
 	t.Run("missing-mvs-are-recreated-against-storage", func(t *testing.T) {
-		plan := planStandaloneMVs(traceCatalog(), expectedTraces())
+		plan := planStandaloneMVs(traceCatalog(), tracesOnly())
 		require.Len(t, plan.Actions, len(expectedTraces()))
 
 		targets := map[string]string{}
@@ -403,7 +426,7 @@ func TestPlanStandaloneMVs(t *testing.T) {
 		require.Equal(t, traces+".distributed_top_level_operations", targets["root_operations"])
 		require.Equal(t, traces+".usage_explorer", targets["usage_explorer_mv"])
 		require.Equal(t, traces+".dependency_graph_minutes_v2", targets["dependency_graph_minutes_db_calls_mv_v2"])
-		require.Empty(t, validateMaterializedViews(plan.Simulated, expectedTraces()))
+		require.Empty(t, validateMaterializedViews(plan.Simulated, tracesOnly()))
 	})
 
 	t.Run("a-missing-mv-is-not-recreated-over-a-non-storage-target", func(t *testing.T) {
@@ -418,11 +441,11 @@ func TestPlanStandaloneMVs(t *testing.T) {
 		}
 		tables[odd.fqName()] = odd
 
-		plan := planStandaloneMVs(tables, expectedTraces())
+		plan := planStandaloneMVs(tables, tracesOnly())
 		require.Len(t, plan.Actions, 1)
 		require.Equal(t, mvActionUnresolvable, plan.Actions[0].Kind)
 		require.Contains(t, plan.Actions[0].String(), "is not a storage table")
-		require.Contains(t, validateMaterializedViews(plan.Simulated, expectedTraces()), e.fqName()+" is missing")
+		require.Contains(t, validateMaterializedViews(plan.Simulated, tracesOnly()), e.fqName()+" is missing")
 	})
 
 	t.Run("an-mv-that-owns-its-storage-is-never-touched", func(t *testing.T) {
@@ -435,7 +458,57 @@ func TestPlanStandaloneMVs(t *testing.T) {
 		}
 		tables[inline.fqName()] = inline
 
-		require.Empty(t, planStandaloneMVs(tables, expectedTraces()).Actions)
+		require.Empty(t, planStandaloneMVs(tables, tracesOnly()).Actions)
+	})
+
+	t.Run("an-mv-a-migration-drops-is-left-alone-and-not-required", func(t *testing.T) {
+		// durationSortMV is dropped by traces migration 1001, which runs in the
+		// async phase; after sync alone it may still exist, even broken.
+		tables := healthyCatalog(t)
+		legacy := materializedView(traces, "durationSortMV", traces+".distributed_usage_explorer", "SELECT 1 FROM signoz_traces.signoz_index_v3")
+		tables[legacy.fqName()] = legacy
+
+		plan := planStandaloneMVs(tables, tracesOnly())
+		require.Empty(t, plan.Actions)
+		require.Empty(t, validateMaterializedViews(plan.Simulated, tracesOnly()))
+	})
+
+	t.Run("reproduces-the-numia-logs-metrics-preflight", func(t *testing.T) {
+		// signoz_metrics on numia-logs on 2026-09-17: storage and aliases in
+		// place, all five rollup MVs gone. check-mvs planned exactly these.
+		metrics := SignozMetricsDB
+		tables := catalogOf(
+			storageTable(metrics, "distributed_samples_v4", "SharedMergeTree"),
+			aliasView(metrics, "samples_v4", metrics+".distributed_samples_v4"),
+			storageTable(metrics, "samples_v4_agg_5m", "SharedAggregatingMergeTree"),
+			aliasView(metrics, "distributed_samples_v4_agg_5m", metrics+".samples_v4_agg_5m"),
+			storageTable(metrics, "samples_v4_agg_30m", "SharedAggregatingMergeTree"),
+			aliasView(metrics, "distributed_samples_v4_agg_30m", metrics+".samples_v4_agg_30m"),
+			storageTable(metrics, "distributed_time_series_v4", "SharedReplacingMergeTree"),
+			aliasView(metrics, "time_series_v4", metrics+".distributed_time_series_v4"),
+			storageTable(metrics, "distributed_time_series_v4_6hrs", "SharedReplacingMergeTree"),
+			aliasView(metrics, "time_series_v4_6hrs", metrics+".distributed_time_series_v4_6hrs"),
+			storageTable(metrics, "distributed_time_series_v4_1day", "SharedReplacingMergeTree"),
+			aliasView(metrics, "time_series_v4_1day", metrics+".distributed_time_series_v4_1day"),
+			storageTable(metrics, "distributed_time_series_v4_1week", "SharedReplacingMergeTree"),
+			aliasView(metrics, "time_series_v4_1week", metrics+".distributed_time_series_v4_1week"),
+		)
+		expected := mvExpectations{Present: expectedIn(metrics), Dropped: expectedMVs().Dropped}
+
+		plan := planStandaloneMVs(tables, expected)
+		var actions []string
+		for _, a := range plan.Actions {
+			actions = append(actions, a.String())
+		}
+		require.Equal(t, []string{
+			"recreate-missing signoz_metrics.samples_v4_agg_30m_mv (TO signoz_metrics.samples_v4_agg_30m)",
+			"recreate-missing signoz_metrics.samples_v4_agg_5m_mv (TO signoz_metrics.samples_v4_agg_5m)",
+			"recreate-missing signoz_metrics.time_series_v4_1day_mv (TO signoz_metrics.distributed_time_series_v4_1day)",
+			"recreate-missing signoz_metrics.time_series_v4_1week_mv (TO signoz_metrics.distributed_time_series_v4_1week)",
+			"recreate-missing signoz_metrics.time_series_v4_6hrs_mv (TO signoz_metrics.distributed_time_series_v4_6hrs)",
+		}, actions)
+		// Every recreated body reads storage, including the chained rollups.
+		require.Empty(t, validateMaterializedViews(plan.Simulated, expected))
 	})
 
 	t.Run("an-unexpected-mv-is-never-dropped", func(t *testing.T) {
@@ -443,7 +516,7 @@ func TestPlanStandaloneMVs(t *testing.T) {
 		extra := materializedView(traces, "someone_elses_mv", traces+".usage_explorer", "SELECT 1 FROM signoz_traces.distributed_signoz_index_v3")
 		tables[extra.fqName()] = extra
 
-		plan := planStandaloneMVs(tables, expectedTraces())
+		plan := planStandaloneMVs(tables, tracesOnly())
 		require.Empty(t, plan.Actions)
 		require.Contains(t, plan.Simulated, extra.fqName())
 	})
@@ -459,10 +532,10 @@ func TestPlanStandaloneMVs(t *testing.T) {
 			AsSelect:         "SELECT toStartOfHour(timestamp) AS timestamp, count()",
 		}
 
-		plan := planStandaloneMVs(tables, expectedTraces())
+		plan := planStandaloneMVs(tables, tracesOnly())
 		require.Len(t, plan.Actions, 1)
 		require.Equal(t, mvActionUnresolvable, plan.Actions[0].Kind)
-		require.NotEmpty(t, validateMaterializedViews(plan.Simulated, expectedTraces()), "sync must fail on it")
+		require.NotEmpty(t, validateMaterializedViews(plan.Simulated, tracesOnly()), "sync must fail on it")
 	})
 
 	t.Run("metrics-layout-with-chained-aggregates", func(t *testing.T) {
@@ -483,18 +556,18 @@ func TestPlanStandaloneMVs(t *testing.T) {
 				"SELECT fingerprint, sum(sum) AS sum FROM signoz_metrics.samples_v4_agg_5m GROUP BY fingerprint"),
 		)
 
-		plan := planStandaloneMVs(tables, nil)
+		plan := planStandaloneMVs(tables, mvExpectations{})
 		require.Equal(t, []mvAction{{
 			Kind: mvActionModifyQuery, Database: metrics, Name: "samples_v4_agg_5m_mv",
 			Target: metrics + ".samples_v4_agg_5m",
 			Select: "SELECT fingerprint, sum(value) AS sum FROM signoz_metrics.distributed_samples_v4 GROUP BY fingerprint",
 		}}, plan.Actions)
-		require.Empty(t, validateMaterializedViews(plan.Simulated, nil))
+		require.Empty(t, validateMaterializedViews(plan.Simulated, mvExpectations{}))
 	})
 }
 
 func TestValidateMaterializedViews(t *testing.T) {
-	require.Empty(t, validateMaterializedViews(healthyCatalog(t), expectedTraces()))
+	require.Empty(t, validateMaterializedViews(healthyCatalog(t), tracesOnly()))
 
 	tables := healthyCatalog(t)
 	summary := expectedByName(t, "trace_summary_mv")
@@ -511,7 +584,7 @@ func TestValidateMaterializedViews(t *testing.T) {
 		"signoz_traces.usage_explorer_mv writes to signoz_traces.distributed_usage_explorer (View), not a storage table",
 		"signoz_traces.root_operations reads from an alias VIEW, so it never fires",
 		"signoz_traces.ghost_mv writes to signoz_traces.nowhere, which does not exist",
-	}, validateMaterializedViews(tables, expectedTraces()))
+	}, validateMaterializedViews(tables, tracesOnly()))
 }
 
 // fakeRows serves one catalog snapshot to loadSignozTables.
@@ -538,13 +611,23 @@ func (r *fakeRows) Err() error   { return nil }
 // records every Exec, failing the ones failExec selects.
 type fakeConn struct {
 	clickhouse.Conn
-	catalogs []map[string]signozTable
-	queries  int
-	execs    []string
-	failExec func(sql string) bool
+	catalogs  []map[string]signozTable
+	queries   int
+	describes []string
+	execs     []string
+	failExec  func(sql string) bool
+	// failDescribe makes DESCRIBE of a SELECT containing this text fail.
+	failDescribe string
 }
 
-func (c *fakeConn) Query(_ context.Context, _ string, _ ...any) (driver.Rows, error) {
+func (c *fakeConn) Query(_ context.Context, sql string, _ ...any) (driver.Rows, error) {
+	if strings.HasPrefix(sql, "DESCRIBE (") {
+		c.describes = append(c.describes, sql)
+		if c.failDescribe != "" && strings.Contains(sql, c.failDescribe) {
+			return nil, errors.New("Unknown expression identifier")
+		}
+		return &fakeRows{data: []signozTable{{}}}, nil
+	}
 	idx := min(c.queries, len(c.catalogs)-1)
 	c.queries++
 	var data []signozTable
@@ -563,7 +646,7 @@ func (c *fakeConn) Exec(_ context.Context, sql string, _ ...any) error {
 }
 
 func newTestManager(conn *fakeConn) *MigrationManager {
-	return &MigrationManager{conn: conn, logger: zap.NewNop(), mvExpected: expectedTraces}
+	return &MigrationManager{conn: conn, logger: zap.NewNop(), mvExpected: tracesOnly}
 }
 
 // statementHeads keeps verb and object of each statement, without the SELECT.
@@ -614,6 +697,13 @@ func TestRecreateMaterializedViewsForStandalone(t *testing.T) {
 		err := newTestManager(conn).RecreateMaterializedViewsForStandalone(ctx)
 		require.ErrorContains(t, err, "usage_explorer_mv writes to signoz_traces.distributed_usage_explorer (View)")
 		require.ErrorContains(t, err, "boom", "the failed step is part of the error")
+	})
+
+	t.Run("a-select-that-does-not-analyze-changes-nothing", func(t *testing.T) {
+		conn := &fakeConn{catalogs: []map[string]signozTable{brokenUsageCatalog(t)}, failDescribe: "service_name"}
+		err := newTestManager(conn).RecreateMaterializedViewsForStandalone(ctx)
+		require.ErrorContains(t, err, "the new SELECT does not analyze, nothing was changed")
+		require.Empty(t, conn.execs, "not even the DROP of the rebuild runs")
 	})
 
 	t.Run("a-from-only-fix-never-drops", func(t *testing.T) {
@@ -676,5 +766,15 @@ func TestCheckMaterializedViewsForStandalone(t *testing.T) {
 		"rebuild signoz_traces.usage_explorer_mv (TO signoz_traces.usage_explorer)",
 	}, report.Actions)
 	require.Empty(t, report.Problems)
+	require.Len(t, conn.describes, 1, "the new SELECT is analyzed")
 	require.Empty(t, conn.execs, "the check must not change anything")
+}
+
+func TestCheckMaterializedViewsForStandaloneReportsABadSelect(t *testing.T) {
+	conn := &fakeConn{catalogs: []map[string]signozTable{brokenUsageCatalog(t)}, failDescribe: "service_name"}
+	report, err := newTestManager(conn).CheckMaterializedViewsForStandalone(context.Background())
+	require.NoError(t, err)
+	require.Len(t, report.Problems, 1)
+	require.Contains(t, report.Problems[0], "signoz_traces.usage_explorer_mv: the SELECT it would get does not analyze")
+	require.Empty(t, conn.execs)
 }

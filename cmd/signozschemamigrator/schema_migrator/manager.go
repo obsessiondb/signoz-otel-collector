@@ -111,8 +111,8 @@ type MigrationManager struct {
 	mvGateWarnOnly bool
 	// mvGateRetryDelay spaces out re-reads of the catalog before the gate fails.
 	mvGateRetryDelay time.Duration
-	// mvExpected lists the MVs the migrations leave behind; nil means expectedMVs.
-	mvExpected func() []expectedMV
+	// mvExpected describes the MVs the migrations leave behind; nil means expectedMVs.
+	mvExpected func() mvExpectations
 }
 
 type Option func(*MigrationManager)
