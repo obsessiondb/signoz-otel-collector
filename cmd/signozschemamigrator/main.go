@@ -57,12 +57,16 @@ func main() {
 
 	var dsn string
 	var development bool
+	var mvGate string
 
 	cmd.PersistentFlags().StringVar(&dsn, "dsn", "", "Clickhouse DSN")
 	cmd.PersistentFlags().BoolVar(&development, "dev", false, "Development mode")
+	cmd.PersistentFlags().StringVar(&mvGate, "mv-gate", "fail",
+		"What a materialized view left misconfigured does to sync/async: fail, or warn (break-glass only)")
 
 	registerSyncMigrate(cmd)
 	registerAsyncMigrate(cmd)
+	registerCheckMVs(cmd)
 
 	if err := cmd.Execute(); err != nil {
 		os.Exit(1)
@@ -82,6 +86,10 @@ func registerSyncMigrate(cmd *cobra.Command) {
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
+			warnOnly, err := mvGateWarnOnly(cmd)
+			if err != nil {
+				return err
+			}
 
 			logger.Info("Running migrations in sync mode (standalone/SharedMergeTree)",
 				zap.String("dsn", dsn),
@@ -137,6 +145,7 @@ func registerSyncMigrate(cmd *cobra.Command) {
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
 				schema_migrator.WithDevelopment(development),
+				schema_migrator.WithMVGateWarnOnly(warnOnly),
 			)
 			if err != nil {
 				return fmt.Errorf("failed to create migration manager: %w", err)
@@ -165,7 +174,12 @@ func registerSyncMigrate(cmd *cobra.Command) {
 				}
 			}
 
-			// Post-migration: fix any MVs with broken TO or FROM clauses (self-heal existing deployments)
+			// An explicit --up/--down is a targeted (often rollback) run: the
+			// catalog is intentionally not at the state every migration leaves.
+			if len(upVersions) != 0 || len(downVersions) != 0 {
+				logger.Info("Skipping materialized view repair for an explicit --up/--down run")
+				return nil
+			}
 			logger.Info("Running post-migration MV repair for standalone mode")
 			return manager.RecreateMaterializedViewsForStandalone(context.Background())
 		},
@@ -190,6 +204,10 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 
 			dsn := cmd.Flags().Lookup("dsn").Value.String()
 			development := strings.ToLower(cmd.Flags().Lookup("dev").Value.String()) == "true"
+			warnOnly, err := mvGateWarnOnly(cmd)
+			if err != nil {
+				return err
+			}
 
 			logger.Info("Running migrations in async mode (standalone/SharedMergeTree)",
 				zap.String("dsn", dsn),
@@ -245,6 +263,7 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 				schema_migrator.WithConnOptions(*opts),
 				schema_migrator.WithLogger(logger),
 				schema_migrator.WithDevelopment(development),
+				schema_migrator.WithMVGateWarnOnly(warnOnly),
 			)
 			if err != nil {
 				return fmt.Errorf("failed to create migration manager: %w", err)
@@ -262,7 +281,12 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 				}
 			}
 
-			// Post-migration: fix any MVs with broken TO or FROM clauses (self-heal existing deployments)
+			// An explicit --up/--down is a targeted (often rollback) run: the
+			// catalog is intentionally not at the state every migration leaves.
+			if len(upVersions) != 0 || len(downVersions) != 0 {
+				logger.Info("Skipping materialized view repair for an explicit --up/--down run")
+				return nil
+			}
 			logger.Info("Running post-migration MV repair for standalone mode")
 			return manager.RecreateMaterializedViewsForStandalone(context.Background())
 		},
@@ -272,4 +296,73 @@ func registerAsyncMigrate(cmd *cobra.Command) {
 	asyncCmd.Flags().StringVar(&downVersions, "down", "", "Down migrations to run, comma separated. Must provide down migrations explicitly to run")
 
 	cmd.AddCommand(asyncCmd)
+}
+
+// registerCheckMVs adds the read-only preflight for the materialized view
+// repair that sync and async run at the end. It prints the exact actions they
+// would take and exits non-zero if anything would still make them fail, so it
+// can be run against production before rolling out a new migrator image.
+func registerCheckMVs(cmd *cobra.Command) {
+	checkCmd := &cobra.Command{
+		Use:          "check-mvs",
+		Short:        "Report the materialized view repairs sync would make, without changing anything",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			logger := getLogger()
+
+			// The DSN carries the password, so it is never logged here.
+			opts, err := clickhouse.ParseDSN(cmd.Flags().Lookup("dsn").Value.String())
+			if err != nil {
+				return fmt.Errorf("failed to parse dsn: %w", err)
+			}
+			conn, err := clickhouse.Open(opts)
+			if err != nil {
+				return fmt.Errorf("failed to open connection: %w", err)
+			}
+			defer conn.Close()
+
+			manager, err := schema_migrator.NewMigrationManager(
+				schema_migrator.WithClusterName(""), // standalone mode
+				schema_migrator.WithReplicationEnabled(false),
+				schema_migrator.WithConn(conn),
+				schema_migrator.WithConnOptions(*opts),
+				schema_migrator.WithLogger(logger),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to create migration manager: %w", err)
+			}
+
+			report, err := manager.CheckMaterializedViewsForStandalone(context.Background())
+			if err != nil {
+				return err
+			}
+			if len(report.Actions) == 0 {
+				fmt.Println("no materialized view changes needed")
+			}
+			for _, action := range report.Actions {
+				fmt.Println("would run:", action)
+			}
+			for _, problem := range report.Problems {
+				fmt.Println("would fail:", problem)
+			}
+			if len(report.Problems) > 0 {
+				return fmt.Errorf("%d problem(s) would make sync fail", len(report.Problems))
+			}
+			fmt.Println("ok: sync would leave every materialized view consistent")
+			return nil
+		},
+	}
+
+	cmd.AddCommand(checkCmd)
+}
+
+func mvGateWarnOnly(cmd *cobra.Command) (bool, error) {
+	switch mode := cmd.Flags().Lookup("mv-gate").Value.String(); mode {
+	case "fail":
+		return false, nil
+	case "warn":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid --mv-gate %q: want fail or warn", mode)
+	}
 }
