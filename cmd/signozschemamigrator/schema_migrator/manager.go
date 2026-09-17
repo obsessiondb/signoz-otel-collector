@@ -1190,6 +1190,21 @@ func (m *MigrationManager) IsAsync(migration SchemaMigrationRecord) bool {
 	return true
 }
 
+// IsSyncOperation reports whether a single operation runs in the sync phase.
+// Mirrors upstream (SigNoz/signoz-otel-collector#760); the migration sanity
+// test in schema_migrator_test.go depends on it.
+func (m *MigrationManager) IsSyncOperation(item Operation) bool {
+	return item.ForceMigrate() || (!item.IsMutation() && item.IsIdempotent() && item.IsLightweight())
+}
+
+// IsAsyncOperation reports whether a single operation runs in the async phase.
+func (m *MigrationManager) IsAsyncOperation(item Operation) bool {
+	if item.ForceMigrate() {
+		return false
+	}
+	return !(!item.IsMutation() && item.IsIdempotent() && item.IsLightweight())
+}
+
 // MigrateUpSync migrates the schema up.
 func (m *MigrationManager) MigrateUpSync(ctx context.Context, upVersions []uint64) error {
 	m.logger.Info("Running migrations up sync")
