@@ -105,6 +105,14 @@ type MigrationManager struct {
 	// Standalone mode tracking: base tables that should be created as VIEWs
 	// (because the distributed_ table is the real storage)
 	pendingBaseTableViews map[string]string // base table name -> distributed table name
+
+	// mvGateWarnOnly downgrades the standalone materialized view gate from
+	// failing the migration to logging, as a break-glass for startup.
+	mvGateWarnOnly bool
+	// mvGateRetryDelay spaces out re-reads of the catalog before the gate fails.
+	mvGateRetryDelay time.Duration
+	// mvExpected describes the MVs the migrations leave behind; nil means expectedMVs.
+	mvExpected func() mvExpectations
 }
 
 type Option func(*MigrationManager)
@@ -122,6 +130,7 @@ func NewMigrationManager(opts ...Option) (*MigrationManager, error) {
 		baseTableEngines:      make(map[string]BaseTableInfo),
 		convertedToViews:      make(map[string]bool),
 		pendingBaseTableViews: make(map[string]string),
+		mvGateRetryDelay:      2 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(mgr)
@@ -130,6 +139,14 @@ func NewMigrationManager(opts ...Option) (*MigrationManager, error) {
 		return nil, errors.New("conn is required")
 	}
 	return mgr, nil
+}
+
+// WithMVGateWarnOnly makes a failed materialized view check log instead of
+// failing sync/async. It is a break-glass, not a mode to run in.
+func WithMVGateWarnOnly(warnOnly bool) Option {
+	return func(mgr *MigrationManager) {
+		mgr.mvGateWarnOnly = warnOnly
+	}
 }
 
 func WithClusterName(clusterName string) Option {
@@ -609,171 +626,6 @@ func (m *MigrationManager) ConvertBaseTablesToViews(ctx context.Context) error {
 	return nil
 }
 
-// RecreateMaterializedViewsForStandalone recreates MVs to fix both TO and FROM clauses.
-// In standalone mode:
-// - TO clause: MVs must write to distributed_* tables (not VIEWs)
-// - FROM clause: MVs must read from distributed_* tables (VIEWs don't trigger on INSERT)
-func (m *MigrationManager) RecreateMaterializedViewsForStandalone(ctx context.Context) error {
-	if m.clusterName != "" {
-		return nil // Only for standalone mode
-	}
-
-	m.logger.Info("Recreating Materialized Views for standalone mode")
-
-	type mvInfo struct {
-		Database   string
-		Name       string
-		AsSelect   string
-		EngineFull string
-	}
-
-	// Fallback mapping for MVs when engine_full is empty (ClickHouse Cloud)
-	mvToDestTable := map[string]string{
-		// Traces MVs
-		"root_operations":                                "signoz_traces.top_level_operations",
-		"sub_root_operations":                            "signoz_traces.top_level_operations",
-		"usage_explorer_mv":                              "signoz_traces.usage_explorer",
-		"dependency_graph_minutes_db_calls_mv_v2":        "signoz_traces.dependency_graph_minutes_v2",
-		"dependency_graph_minutes_messaging_calls_mv_v2": "signoz_traces.dependency_graph_minutes_v2",
-		"dependency_graph_minutes_service_calls_mv_v2":   "signoz_traces.dependency_graph_minutes_v2",
-		"durationSortMV":                                 "signoz_traces.durationSort",
-		"trace_summary_mv":                               "signoz_traces.trace_summary",
-		// Metrics MVs
-		"samples_v4_agg_5m_mv":                  "signoz_metrics.samples_v4_agg_5m",
-		"samples_v4_agg_30m_mv":                 "signoz_metrics.samples_v4_agg_30m",
-		"time_series_v4_6hrs_mv":                "signoz_metrics.time_series_v4_6hrs",
-		"time_series_v4_1day_mv":                "signoz_metrics.time_series_v4_1day",
-		"time_series_v4_1week_mv":               "signoz_metrics.time_series_v4_1week",
-		"time_series_v4_6hrs_mv_separate_attrs": "signoz_metrics.time_series_v4_6hrs",
-		"time_series_v4_1day_mv_separate_attrs": "signoz_metrics.time_series_v4_1day",
-		"time_series_v4_1week_mv_separate_attrs": "signoz_metrics.time_series_v4_1week",
-		// Logs MVs
-		"attribute_keys_string_final_mv":  "signoz_logs.logs_attribute_keys",
-		"attribute_keys_int64_final_mv":   "signoz_logs.logs_attribute_keys",
-		"attribute_keys_float64_final_mv": "signoz_logs.logs_attribute_keys",
-		"attribute_keys_bool_final_mv":    "signoz_logs.logs_attribute_keys",
-		"resource_keys_string_final_mv":   "signoz_logs.logs_resource_keys",
-		"samples_agg_1d_mv":              "signoz_meter.distributed_samples_agg_1d",
-	}
-
-	// Query ALL materialized views in signoz databases
-	query := `
-		SELECT database, name, as_select, engine_full
-		FROM system.tables
-		WHERE engine = 'MaterializedView'
-		  AND database LIKE 'signoz_%'
-	`
-
-	rows, err := m.conn.Query(ctx, query)
-	if err != nil {
-		m.logger.Error("Failed to query materialized views", zap.Error(err))
-		return err
-	}
-	defer rows.Close()
-
-	var allMVs []mvInfo
-	for rows.Next() {
-		var mv mvInfo
-		if err := rows.Scan(&mv.Database, &mv.Name, &mv.AsSelect, &mv.EngineFull); err != nil {
-			m.logger.Error("Failed to scan MV row", zap.Error(err))
-			return err
-		}
-		allMVs = append(allMVs, mv)
-	}
-
-	m.logger.Info("Found total MVs to check", zap.Int("count", len(allMVs)))
-
-	for _, mv := range allMVs {
-		// Parse the destination table from engine_full
-		destTable := ""
-		if idx := strings.Index(mv.EngineFull, " TO "); idx != -1 {
-			destTable = strings.TrimSpace(mv.EngineFull[idx+4:])
-			if spaceIdx := strings.Index(destTable, " "); spaceIdx != -1 {
-				destTable = destTable[:spaceIdx]
-			}
-		}
-
-		// Fallback: use known mapping if engine_full is empty
-		if destTable == "" {
-			if dest, ok := mvToDestTable[mv.Name]; ok {
-				destTable = dest
-				m.logger.Info("Using fallback destination table for MV",
-					zap.String("mv", mv.Name), zap.String("dest", destTable))
-			}
-		}
-
-		if destTable == "" {
-			m.logger.Warn("Could not parse destination table from MV, will still check FROM clause",
-				zap.String("mv", mv.Name), zap.String("engine_full", mv.EngineFull))
-		}
-
-		// Determine if TO clause needs fixing
-		needsToFix := false
-		newDestTable := destTable
-		destParts := strings.Split(destTable, ".")
-		if len(destParts) == 2 && !strings.HasPrefix(destParts[1], "distributed_") {
-			candidate := fmt.Sprintf("%s.distributed_%s", destParts[0], destParts[1])
-			existsQuery := fmt.Sprintf("EXISTS %s", candidate)
-			var exists uint8
-			if err := m.conn.QueryRow(ctx, existsQuery).Scan(&exists); err == nil && exists == 1 {
-				needsToFix = true
-				newDestTable = candidate
-			}
-		}
-
-		// Determine if FROM clause needs fixing (as_select references base table VIEWs)
-		needsFromFix := false
-		rewrittenSelect := mv.AsSelect
-		for baseKey, distKey := range m.baseToDistributed {
-			if strings.Contains(rewrittenSelect, baseKey) {
-				needsFromFix = true
-				m.logger.Info("Standalone mode: rewriting MV FROM clause in recreation",
-					zap.String("mv", mv.Name),
-					zap.String("old_ref", baseKey),
-					zap.String("new_ref", distKey))
-				rewrittenSelect = strings.ReplaceAll(rewrittenSelect, baseKey, distKey)
-			}
-		}
-
-		if !needsToFix && !needsFromFix {
-			continue
-		}
-
-		// Can't recreate without a destination table
-		if newDestTable == "" {
-			m.logger.Warn("MV needs FROM fix but destination table unknown, skipping",
-				zap.String("mv", mv.Database+"."+mv.Name))
-			continue
-		}
-
-		m.logger.Info("Recreating MV for standalone mode",
-			zap.String("mv", mv.Database+"."+mv.Name),
-			zap.Bool("to_fix", needsToFix),
-			zap.Bool("from_fix", needsFromFix),
-			zap.String("dest", newDestTable))
-
-		// Drop the old MV
-		dropSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s.%s", mv.Database, mv.Name)
-		m.logger.Info("Dropping old MV", zap.String("sql", dropSQL))
-		if err := m.conn.Exec(ctx, dropSQL); err != nil {
-			m.logger.Error("Failed to drop MV", zap.Error(err), zap.String("mv", mv.Name))
-			return err
-		}
-
-		// Recreate the MV with fixed TO and FROM
-		createSQL := fmt.Sprintf("CREATE MATERIALIZED VIEW %s.%s TO %s AS %s",
-			mv.Database, mv.Name, newDestTable, rewrittenSelect)
-		m.logger.Info("Creating new MV", zap.String("sql", createSQL))
-		if err := m.conn.Exec(ctx, createSQL); err != nil {
-			m.logger.Error("Failed to create MV", zap.Error(err), zap.String("mv", mv.Name))
-			return err
-		}
-	}
-
-	m.logger.Info("Finished recreating Materialized Views for standalone mode")
-	return nil
-}
-
 // HostAddrs returns the addresses of the all hosts in the cluster.
 func (m *MigrationManager) HostAddrs() ([]string, error) {
 	if m.development || m.clusterName == "" {
@@ -1125,23 +977,28 @@ func (m *MigrationManager) shouldSkipMigrationInStandaloneMode(db string, migrat
 		return false
 	}
 
-	// Migrations to skip in standalone mode:
-	// - signoz_traces migration 1008: Adds timestamp column to span_attributes_keys (OTEL collector doesn't provide it)
-	// - signoz_logs migration 1002: Adds timestamp column to logs_attribute_keys and logs_resource_keys
-	// - signoz_logs migration 1003: Materializes timestamp column in logs_attribute_keys and logs_resource_keys
-	skipMigrations := map[string][]uint64{
-		SignozTracesDB: {1008},
-		SignozLogsDB:   {1002, 1003},
+	if isSkippedInStandaloneMode(db, migrationID) {
+		m.logger.Info("Standalone mode: skipping migration that adds unsupported columns",
+			zap.String("db", db),
+			zap.Uint64("migration_id", migrationID))
+		return true
 	}
+	return false
+}
 
-	if migrationsToSkip, ok := skipMigrations[db]; ok {
-		for _, skipID := range migrationsToSkip {
-			if migrationID == skipID {
-				m.logger.Info("Standalone mode: skipping migration that adds unsupported columns",
-					zap.String("db", db),
-					zap.Uint64("migration_id", migrationID))
-				return true
-			}
+// standaloneSkippedMigrations are never run in standalone mode:
+// - signoz_traces migration 1008: Adds timestamp column to span_attributes_keys (OTEL collector doesn't provide it)
+// - signoz_logs migration 1002: Adds timestamp column to logs_attribute_keys and logs_resource_keys
+// - signoz_logs migration 1003: Materializes timestamp column in logs_attribute_keys and logs_resource_keys
+var standaloneSkippedMigrations = map[string][]uint64{
+	SignozTracesDB: {1008},
+	SignozLogsDB:   {1002, 1003},
+}
+
+func isSkippedInStandaloneMode(db string, migrationID uint64) bool {
+	for _, skipID := range standaloneSkippedMigrations[db] {
+		if migrationID == skipID {
+			return true
 		}
 	}
 	return false
@@ -1188,6 +1045,21 @@ func (m *MigrationManager) IsAsync(migration SchemaMigrationRecord) bool {
 	}
 
 	return true
+}
+
+// IsSyncOperation reports whether a single operation runs in the sync phase.
+// Mirrors upstream (SigNoz/signoz-otel-collector#760); the migration sanity
+// test in schema_migrator_test.go depends on it.
+func (m *MigrationManager) IsSyncOperation(item Operation) bool {
+	return item.ForceMigrate() || (!item.IsMutation() && item.IsIdempotent() && item.IsLightweight())
+}
+
+// IsAsyncOperation reports whether a single operation runs in the async phase.
+func (m *MigrationManager) IsAsyncOperation(item Operation) bool {
+	if item.ForceMigrate() {
+		return false
+	}
+	return !(!item.IsMutation() && item.IsIdempotent() && item.IsLightweight())
 }
 
 // MigrateUpSync migrates the schema up.
