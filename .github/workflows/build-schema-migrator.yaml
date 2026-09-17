@@ -6,6 +6,12 @@ on:
       - 'v*'
     branches:
       - main
+  pull_request:
+    paths:
+      - 'cmd/signozschemamigrator/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/build-schema-migrator.yaml'
   workflow_dispatch:
 
 env:
@@ -13,7 +19,30 @@ env:
   IMAGE_NAME: obsessiondb/signoz-schema-migrator
 
 jobs:
+  # `:main` is what the ObsessionDB SigNoz deployment pulls on every restart,
+  # so nothing gets published without the migrator's tests passing first.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./cmd/signozschemamigrator/...
+
+      - name: Test
+        run: go test ./cmd/signozschemamigrator/...
+
   build:
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
