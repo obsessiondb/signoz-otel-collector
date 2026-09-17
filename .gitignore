@@ -24,7 +24,9 @@ vendor/
 .build
 *.rollback
 signoz-collector
-signozschemamigrator
+# only the binary `go build ./cmd/signozschemamigrator` drops at the repo root;
+# unanchored, this also ignored every new file under cmd/signozschemamigrator/
+/signozschemamigrator
 
 # tmp
 tmp/
